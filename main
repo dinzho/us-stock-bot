@@ -1,140 +1,84 @@
-# requirements.txt
-# yfinance pandas pandas-ta requests schedule beautifulsoup4 python-dotenv
-
-import yfinance as yf
+import os, json, time, logging, requests
 import pandas as pd
 import pandas_ta as ta
-import requests
-import json
-import os
-import time
-from datetime import datetime, timedelta
-import logging
+import yfinance as yf
+from datetime import datetime
+import pytz
+from dotenv import load_dotenv
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-# === 1. 動態股池管理 ===
+# 1. 動態股池管理
 POOL_FILE = "us_stock_pool.json"
+def load_pool(): return json.load(open(POOL_FILE)) if os.path.exists(POOL_FILE) else {"active": []}
+def save_pool(d): json.dump(d, open(POOL_FILE, "w"))
 
-def load_pool():
-    if os.path.exists(POOL_FILE):
-        with open(POOL_FILE, "r") as f:
-            return json.load(f)
-    return {"active": [], "last_full_scan": None}
+# 2. 拉取全市場代碼
+def fetch_universe():
+    urls = [
+        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full.csv",
+        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/amex/amex_full.csv",
+        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nyse/nyse_full.csv"
+    ]
+    dfs = [pd.read_csv(u) for u in urls]
+    df = pd.concat(dfs, ignore_index=True)
+    return df["Symbol"].dropna().unique().tolist()
 
-def save_pool(pool):
-    with open(POOL_FILE, "w") as f:
-        json.dump(pool, f)
-
-# === 2. 獲取美股全列表 & 剔除垃圾股 ===
-def fetch_universe(full_scan=False):
+# 3. 過濾活躍股
+def filter_active(tickers):
     pool = load_pool()
-    if full_scan or not pool["active"]:
-        # yfinance 不提供直接全列表，可從 Nasdaq/Finviz 靜態列表下載
-        # 此處以公開 CSV 為例：https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full.csv
-        url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full.csv"
-        df = pd.read_csv(url)
-        tickers = df["Symbol"].unique().tolist()
-        pool["active"] = tickers
-        pool["last_full_scan"] = datetime.now().isoformat()
+    today = datetime.now(pytz.timezone(os.getenv("TZ","Asia/Hong_Kong"))).date().isoformat()
+    if not pool.get("active") or pool.get("last_full_scan") != today:
+        pool["active"] = fetch_universe()
+        pool["last_full_scan"] = today
         save_pool(pool)
-    return pool["active"]
-
-def filter_stocks(tickers):
-    """剔除低成交、仙股、僵屍股"""
+    
     valid = []
-    batch_size = 50
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i+batch_size]
+    batch = 50
+    for i in range(0, len(pool["active"]), batch):
+        syms = pool["active"][i:i+batch]
         try:
-            data = yf.download(batch, period="5d", interval="1d", group_by="ticker", progress=False)
-            for sym in batch:
-                if sym not in data.columns.levels[0]: continue
-                df = data[sym].dropna()
+            data = yf.download(syms, period="5d", interval="1d", group_by="ticker", progress=False)
+            for s in syms:
+                if s not in data.columns.levels[0]: continue
+                df = data[s].dropna()
                 if df.empty: continue
-                price = df["Close"].iloc[-1]
-                vol = df["Volume"].iloc[-1]
-                avg_vol = df["Volume"].rolling(20).mean().iloc[-1] if len(df)>=20 else vol
-                if price >= 1.0 and vol >= 500_000 and avg_vol >= 300_000:
-                    valid.append(sym)
-        except Exception as e:
-            logging.warning(f"批次過濾失敗 {batch}: {e}")
-        time.sleep(1.5)  # 避免 yfinance 限速
+                if df["Close"].iloc[-1] >= 1.0 and df["Volume"].iloc[-1] >= 500_000:
+                    valid.append(s)
+        except: pass
+        time.sleep(1.2)
     return valid
 
-# === 3. Noise + 技術指標計算 ===
-def calc_signals(tickers):
+# 4. 指標計算 + 排名 + 飛書推送（沿用前文邏輯，精簡整合）
+def scan_and_push():
+    logging.info("🚀 開始掃描...")
+    tickers = filter_active([])
     results = []
     for sym in tickers:
         try:
             df = yf.download(sym, period="60d", interval="1d", progress=False)
-            if df.empty or len(df) < 20: continue
-            
-            # Noise: ATR(14)/Close * 成交量突增比
-            df["ATR"] = ta.atr(df["High"], df["Low"], df["Close"], length=14)
-            df["Noise"] = (df["ATR"] / df["Close"]) * (df["Volume"] / df["Volume"].rolling(20).mean())
-            
-            # MACD
-            df.ta.macd(append=True)
-            # 布林帶
-            df.ta.bbands(length=20, append=True)
-            
-            # Fibonacci (20日高低)
-            swing_high = df["High"].rolling(20).max().iloc[-1]
-            swing_low = df["Low"].rolling(20).min().iloc[-1]
-            fib_diff = swing_high - swing_low
-            df["FIB_382"] = swing_high - 0.382 * fib_diff
-            df["FIB_618"] = swing_high - 0.618 * fib_diff
-            
-            last = df.iloc[-1]
-            noise_score = last["Noise"] if "Noise" in last.index else 0
-            
-            # 簡單做多/做空信號
-            long_signal = (last["MACD_12_26_9"] > last["MACDs_12_26_9"] and 
-                           last["Close"] > last["BBL_5_2.0"] and
-                           last["Close"] < last["FIB_618"])
-            short_signal = (last["MACD_12_26_9"] < last["MACDs_12_26_9"] and 
-                            last["Close"] < last["BBU_5_2.0"] and
-                            last["Close"] > last["FIB_382"])
-            
-            results.append({
-                "symbol": sym,
-                "noise": noise_score,
-                "price": last["Close"],
-                "long": bool(long_signal),
-                "short": bool(short_signal),
-                "macd_cross": "金叉" if last["MACD_12_26_9"] > last["MACDs_12_26_9"] else "死叉",
-                "bb_pos": "突破上軌" if last["Close"] > last["BBU_5_2.0"] else "跌破下軌" if last["Close"] < last["BBL_5_2.0"] else "區間內",
-                "vol_ratio": last["Volume"] / df["Volume"].rolling(20).mean().iloc[-1]
-            })
-        except Exception as e:
-            logging.warning(f"指標計算失敗 {sym}: {e}")
-    return results
+            if len(df) < 20: continue
+            df.ta.atr(append=True); df.ta.macd(append=True); df.ta.bbands(append=True)
+            noise = (df["ATR_14"].iloc[-1] / df["Close"].iloc[-1]) * (df["Volume"].iloc[-1] / df["Volume"].rolling(20).mean().iloc[-1])
+            long = df["MACD_12_26_9"].iloc[-1] > df["MACDs_12_26_9"].iloc[-1] and df["Close"].iloc[-1] > df["BBL_5_2.0"].iloc[-1]
+            short = df["MACD_12_26_9"].iloc[-1] < df["MACDs_12_26_9"].iloc[-1] and df["Close"].iloc[-1] < df["BBU_5_2.0"].iloc[-1]
+            results.append({"symbol":sym, "noise":noise, "price":df["Close"].iloc[-1], "long":long, "short":short, "vol_ratio":df["Volume"].iloc[-1]/df["Volume"].rolling(20).mean().iloc[-1]})
+        except: pass
 
-# === 4. 新聞與綜合評分 ===
-def fetch_news(sym):
-    try:
-        info = yf.Ticker(sym)
-        news = info.news[:3]
-        headlines = [n.get("title", "") for n in news]
-        # 簡單關鍵字打分
-        pos_kw = ["beat", "upgrade", "fda", "approved", "surge", "buy"]
-        neg_kw = ["downgrade", "layoff", "probe", "fraud", "miss", "sue"]
-        score = sum(1 for h in headlines if any(k in h.lower() for k in pos_kw))
-        score -= sum(1 for h in headlines if any(k in h.lower() for k in neg_kw))
-        return score, headlines
-    except:
-        return 0, ["無近期新聞"]
+    longs = sorted([r for r in results if r["long"]], key=lambda x: x["noise"], reverse=True)[:5]
+    shorts = sorted([r for r in results if r["short"]], key=lambda x: x["noise"], reverse=True)[:5]
 
-def rank_stocks(signals):
-    for s in signals:
-        news_score, headlines = fetch_news(s["symbol"])
-        s["news_score"] = news_score
-        s["headlines"] = headlines
-        # 綜合分數：Noise 40% + TA強度 40% + 新聞 20%
-        ta_score = (2 if s["long"] else 0) + (2 if s["short"] else 0)
-        s["total_score"] = s["noise"] * 0.4 + ta_score * 10 * 0.4 + s["news_score"] * 0.2
-    
-    longs = sorted([s for s in signals if s["long"]], key=lambda x: x["total_score"], reverse=True)[:5]
-    shorts = sorted([s for s in signals if s["short"]], key=lambda x: x["total_score"], reverse=True)[:5]
-    return longs, shorts
+    webhook = os.getenv("FEISHU_WEBHOOK")
+    if not webhook: logging.error("❌ 缺少 FEISHU_WEBHOOK"); return
+    msg = {"msg_type":"interactive","card":{"header":{"title":{"tag":"plain_text","content":f"🤖 美股 Noise Top5 報告 ({datetime.now().strftime('%Y-%m-%d %H:%M')})"},"template":"blue"},"elements":[
+        {"tag":"markdown","content":"### 🟢 做多候選"},
+        {"tag":"markdown","content":"\n".join([f"🔹 {s['symbol']} | ${s['price']:.2f} | Noise:{s['noise']:.3f} | 量比:{s['vol_ratio']:.1f}x" for s in longs]) or "無符合條件"},
+        {"tag":"markdown","content":"### 🔴 做空候選"},
+        {"tag":"markdown","content":"\n".join([f"🔹 {s['symbol']} | ${s['price']:.2f} | Noise:{s['noise']:.3f} | 量比:{s['vol_ratio']:.1f}x" for s in shorts]) or "無符合條件"}
+    ]}}
+    res = requests.post(webhook, json=msg)
+    logging.info(f"📤 飛書推送: {res.status_code} {res.text[:100]}")
+
+if __name__ == "__main__":
+    scan_and_push()
