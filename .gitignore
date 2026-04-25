@@ -1,0 +1,6 @@
+.env
+*.pyc
+__pycache__/
+us_stock_pool.json
+logs/
+.DS_Store
