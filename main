@@ -1,0 +1,140 @@
+# requirements.txt
+# yfinance pandas pandas-ta requests schedule beautifulsoup4 python-dotenv
+
+import yfinance as yf
+import pandas as pd
+import pandas_ta as ta
+import requests
+import json
+import os
+import time
+from datetime import datetime, timedelta
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+# === 1. 動態股池管理 ===
+POOL_FILE = "us_stock_pool.json"
+
+def load_pool():
+    if os.path.exists(POOL_FILE):
+        with open(POOL_FILE, "r") as f:
+            return json.load(f)
+    return {"active": [], "last_full_scan": None}
+
+def save_pool(pool):
+    with open(POOL_FILE, "w") as f:
+        json.dump(pool, f)
+
+# === 2. 獲取美股全列表 & 剔除垃圾股 ===
+def fetch_universe(full_scan=False):
+    pool = load_pool()
+    if full_scan or not pool["active"]:
+        # yfinance 不提供直接全列表，可從 Nasdaq/Finviz 靜態列表下載
+        # 此處以公開 CSV 為例：https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full.csv
+        url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_full.csv"
+        df = pd.read_csv(url)
+        tickers = df["Symbol"].unique().tolist()
+        pool["active"] = tickers
+        pool["last_full_scan"] = datetime.now().isoformat()
+        save_pool(pool)
+    return pool["active"]
+
+def filter_stocks(tickers):
+    """剔除低成交、仙股、僵屍股"""
+    valid = []
+    batch_size = 50
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i+batch_size]
+        try:
+            data = yf.download(batch, period="5d", interval="1d", group_by="ticker", progress=False)
+            for sym in batch:
+                if sym not in data.columns.levels[0]: continue
+                df = data[sym].dropna()
+                if df.empty: continue
+                price = df["Close"].iloc[-1]
+                vol = df["Volume"].iloc[-1]
+                avg_vol = df["Volume"].rolling(20).mean().iloc[-1] if len(df)>=20 else vol
+                if price >= 1.0 and vol >= 500_000 and avg_vol >= 300_000:
+                    valid.append(sym)
+        except Exception as e:
+            logging.warning(f"批次過濾失敗 {batch}: {e}")
+        time.sleep(1.5)  # 避免 yfinance 限速
+    return valid
+
+# === 3. Noise + 技術指標計算 ===
+def calc_signals(tickers):
+    results = []
+    for sym in tickers:
+        try:
+            df = yf.download(sym, period="60d", interval="1d", progress=False)
+            if df.empty or len(df) < 20: continue
+            
+            # Noise: ATR(14)/Close * 成交量突增比
+            df["ATR"] = ta.atr(df["High"], df["Low"], df["Close"], length=14)
+            df["Noise"] = (df["ATR"] / df["Close"]) * (df["Volume"] / df["Volume"].rolling(20).mean())
+            
+            # MACD
+            df.ta.macd(append=True)
+            # 布林帶
+            df.ta.bbands(length=20, append=True)
+            
+            # Fibonacci (20日高低)
+            swing_high = df["High"].rolling(20).max().iloc[-1]
+            swing_low = df["Low"].rolling(20).min().iloc[-1]
+            fib_diff = swing_high - swing_low
+            df["FIB_382"] = swing_high - 0.382 * fib_diff
+            df["FIB_618"] = swing_high - 0.618 * fib_diff
+            
+            last = df.iloc[-1]
+            noise_score = last["Noise"] if "Noise" in last.index else 0
+            
+            # 簡單做多/做空信號
+            long_signal = (last["MACD_12_26_9"] > last["MACDs_12_26_9"] and 
+                           last["Close"] > last["BBL_5_2.0"] and
+                           last["Close"] < last["FIB_618"])
+            short_signal = (last["MACD_12_26_9"] < last["MACDs_12_26_9"] and 
+                            last["Close"] < last["BBU_5_2.0"] and
+                            last["Close"] > last["FIB_382"])
+            
+            results.append({
+                "symbol": sym,
+                "noise": noise_score,
+                "price": last["Close"],
+                "long": bool(long_signal),
+                "short": bool(short_signal),
+                "macd_cross": "金叉" if last["MACD_12_26_9"] > last["MACDs_12_26_9"] else "死叉",
+                "bb_pos": "突破上軌" if last["Close"] > last["BBU_5_2.0"] else "跌破下軌" if last["Close"] < last["BBL_5_2.0"] else "區間內",
+                "vol_ratio": last["Volume"] / df["Volume"].rolling(20).mean().iloc[-1]
+            })
+        except Exception as e:
+            logging.warning(f"指標計算失敗 {sym}: {e}")
+    return results
+
+# === 4. 新聞與綜合評分 ===
+def fetch_news(sym):
+    try:
+        info = yf.Ticker(sym)
+        news = info.news[:3]
+        headlines = [n.get("title", "") for n in news]
+        # 簡單關鍵字打分
+        pos_kw = ["beat", "upgrade", "fda", "approved", "surge", "buy"]
+        neg_kw = ["downgrade", "layoff", "probe", "fraud", "miss", "sue"]
+        score = sum(1 for h in headlines if any(k in h.lower() for k in pos_kw))
+        score -= sum(1 for h in headlines if any(k in h.lower() for k in neg_kw))
+        return score, headlines
+    except:
+        return 0, ["無近期新聞"]
+
+def rank_stocks(signals):
+    for s in signals:
+        news_score, headlines = fetch_news(s["symbol"])
+        s["news_score"] = news_score
+        s["headlines"] = headlines
+        # 綜合分數：Noise 40% + TA強度 40% + 新聞 20%
+        ta_score = (2 if s["long"] else 0) + (2 if s["short"] else 0)
+        s["total_score"] = s["noise"] * 0.4 + ta_score * 10 * 0.4 + s["news_score"] * 0.2
+    
+    longs = sorted([s for s in signals if s["long"]], key=lambda x: x["total_score"], reverse=True)[:5]
+    shorts = sorted([s for s in signals if s["short"]], key=lambda x: x["total_score"], reverse=True)[:5]
+    return longs, shorts
